@@ -259,23 +259,13 @@ export function chienSearch(field, lambda, L) {
 }
 
 /**
- * 完整复核入口。成功返回结构化证据；任何无法闭合的情况抛出中文 Error。
- *
- * 输入：
- *   m        域阶数（2..20）
- *   polyStr  m 次本原多项式比特串（首位 x^m，末位常数项）
- *   t        纠错能力
- *   rStr     长度恰为 2^m−1 的接收码字（最左为 x^(n−1)）
+ * 单块复核的内部管线：本原多项式与生成多项式已在外部验证/构造完毕，
+ * 此处只跑接收串校验 → 综合症 → BM → Chien → 翻转后综合症归零裁决。
+ * 单块入口 analyzeBch 与连续帧入口 analyzeBchFrame 共用本函数，
+ * 以保证“每个块接受既有复核流程”。
  */
-export function analyzeBch({ m, polyStr, t, rStr }) {
-  // 1) 先验证多项式确为 m 次本原多项式。
-  const f = validatePrimitivePolynomial(m, polyStr);
-  const field = makeField(m, f);
+function analyzeBlock(field, { m, polyStr, t, generator, rStr }) {
   const n = field.n;
-
-  // 2) 由连续根 α..α^(2t) 的循环陪集构造二进制生成多项式。
-  const generator = buildGenerator(field, m, t);
-
   // 3) 接收串合法性。
   if (typeof rStr !== 'string' || rStr.length !== n || !/^[01]+$/.test(rStr)) {
     if (typeof rStr !== 'string' || !/^[01]+$/.test(rStr)) {
@@ -364,6 +354,123 @@ export function analyzeBch({ m, polyStr, t, rStr }) {
         ? '综合症全部为零：接收码字本身就是合法码字，无需纠正。'
         : `可纠正：定位到 ${L} 个错误比特，纠正后全部 ${twoT} 个综合症归零。`,
   };
+}
+
+/**
+ * 完整单块复核入口（保留原有行为）。成功返回结构化证据；
+ * 本原多项式、参数组合、接收串或定位证据任一环无法闭合时抛出中文 Error。
+ *
+ * 输入：
+ *   m        域阶数（2..20）
+ *   polyStr  m 次本原多项式比特串（首位 x^m，末位常数项）
+ *   t        纠错能力
+ *   rStr     长度恰为 2^m−1 的接收码字（最左为 x^(n−1)）
+ */
+export function analyzeBch({ m, polyStr, t, rStr }) {
+  // 1) 先验证多项式确为 m 次本原多项式。
+  const f = validatePrimitivePolynomial(m, polyStr);
+  const field = makeField(m, f);
+
+  // 2) 由连续根 α..α^(2t) 的循环陪集构造二进制生成多项式。
+  const generator = buildGenerator(field, m, t);
+
+  // 3..7) 与连续帧共用同一条逐块复核管线。
+  return analyzeBlock(field, { m, polyStr, t, generator, rStr });
+}
+
+/**
+ * 连续帧批量复核入口。地面工程师一次下传得到 blockCount 个使用同一组
+ * BCH 参数（m / 本原多项式 / t）的等长码字，拼接为一段连续比特串。
+ *
+ * 本函数按当前 m 推导出的码长 n = 2^m−1 切分：第 b 块为 frame[b·n … (b+1)n)，
+ * 每个块都走与 analyzeBch 完全相同的复核流程（analyzeBlock）。
+ *
+ * 与单块不同的整体级输入错误（块数非法、总长度不等于 blockCount·n、
+ * 比特串含非 0/1 字符）直接抛出中文 Error，不产生任何块结论。
+ * 参数级错误（m / 多项式 / t 非法）同样直接抛出，错误信息与单块一致。
+ *
+ * 块级失败（超出纠错能力、定位证据不闭合等）不会中断其余块：
+ * 返回 { mode:'frame', params, generator, blockCount, n, frame, correctedFrame,
+ *         allCorrectable, blocks:[{index, range, ok, result? , reason?}] }，
+ * 仅当所有块 ok 时 allCorrectable 才为真，correctedFrame 也只在此时给出。
+ */
+export function analyzeBchFrame({ m, polyStr, t, blockCount, frameStr }) {
+  // 1) 块数合法性：正整数；同时给出上限，避免异常输入导致病态切分。
+  const count = Number(blockCount);
+  if (!Number.isInteger(count) || count < 1) {
+    throw new Error('块数非法：需为不小于 1 的整数。');
+  }
+  if (count > 4096) {
+    throw new Error(`块数非法：单次批量复核最多 4096 块，实际 ${count} 块。`);
+  }
+
+  // 2) 连续比特串字符合法性（与长度无关，先于参数检查给出准确原因）。
+  if (typeof frameStr !== 'string' || frameStr.length === 0) {
+    throw new Error('连续比特串为空：请粘贴整帧连续比特（仅含 0/1，块间不要插入分隔符或空白）。');
+  }
+  if (!/^[01]+$/.test(frameStr)) {
+    throw new Error('连续比特串非法：只能包含字符 0 和 1（块间不要插入分隔符或空白）。');
+  }
+
+  // 3) 验证多项式确为 m 次本原多项式（与单块同一入口、同一中文错误），推导码长 n。
+  const f = validatePrimitivePolynomial(m, polyStr);
+  const field = makeField(m, f);
+  const n = field.n;
+
+  // 4) 总长度必须恰为 blockCount·n。
+  const expectedLen = count * n;
+  if (frameStr.length !== expectedLen) {
+    throw new Error(
+      `连续比特串总长度非法：${count} 块 × n=${n}（2^${m}−1）应恰为 ${expectedLen} 位，实际 ${frameStr.length} 位（相差 ${Math.abs(frameStr.length - expectedLen)} 位）。`
+    );
+  }
+
+  // 5) 生成多项式只构造一次；参数非法时（如 t 越界）在逐块复核前直接失败。
+  const generator = buildGenerator(field, m, t);
+
+  // 5) 逐块切分并走既有复核流程；任一块失败都保留其余块结果。
+  const blocks = [];
+  let allCorrectable = true;
+  for (let b = 0; b < count; b++) {
+    const start = b * n;
+    const rStr = frameStr.slice(start, start + n);
+    const block = {
+      index: b,
+      ordinal: b + 1,
+      range: { start: start + 1, end: start + n }, // 串内 1 基闭区间
+      ok: false,
+    };
+    try {
+      block.result = analyzeBlock(field, { m, polyStr, t, generator, rStr });
+      block.ok = true;
+    } catch (err) {
+      block.ok = false;
+      block.reason = err && err.message ? err.message : String(err);
+      allCorrectable = false;
+    }
+    blocks.push(block);
+  }
+
+  const response = {
+    mode: 'frame',
+    params: { m, n, t, blockCount: count, primitiveBits: polyStr, k: generator.k },
+    generator: {
+      bits: generator.g.toString(2),
+      text: formatBinaryPolynomial(generator.g),
+      degree: generator.degree,
+      k: generator.k,
+      cosets: generator.cosets,
+    },
+    blockCount: count,
+    n,
+    frame: frameStr,
+    blocks,
+    allCorrectable,
+  };
+  if (allCorrectable) {
+    response.correctedFrame = blocks.map((b) => b.result.corrected).join('');
+  }
+  return response;
 }
 
 // 小参数场景的整数版工具，供测试直接复核整除性（公共 API）。

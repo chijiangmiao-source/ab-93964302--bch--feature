@@ -8,7 +8,7 @@ import { once } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { analyzeBch } from '../src/bch.js';
+import { analyzeBch, analyzeBchFrame } from '../src/bch.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -107,7 +107,62 @@ async function main() {
       `[smoke] /sample.json 200 OK -> 纠正 ${result.errorCount} 位，g=${result.generator.text}`
     );
     console.log(`[smoke] 纠正码字：${result.corrected}`);
-    console.log('\n全部复核通过：测试、构建、健康页与可纠正样例冒烟均闭合。');
+    // 连续帧样例冒烟：经 HTTP 取得样例，在本地执行同一套逐块复核规则
+    const fResp = await fetch(`${base}/frame-sample.json`);
+    if (fResp.status !== 200) throw new Error(`/frame-sample.json 状态码 ${fResp.status}`);
+    const frameSample = await fResp.json();
+
+    // 场景一：合法连续帧，整帧可采用
+    const good = analyzeBchFrame(frameSample.goodFrame.input);
+    const ge = frameSample.goodFrame.expect;
+    if (good.allCorrectable !== ge.allCorrectable) {
+      throw new Error('连续帧样例：整帧应可采用。');
+    }
+    if (good.blockCount !== ge.blockCount || good.n !== ge.n) {
+      throw new Error('连续帧样例：块数或码长与构建期记录不一致。');
+    }
+    if (good.correctedFrame !== ge.correctedFrame) {
+      throw new Error('连续帧样例：纠正整帧与构建期记录不一致。');
+    }
+    const gotCounts = good.blocks.map((b) => b.result.errorCount);
+    if (JSON.stringify(gotCounts) !== JSON.stringify(ge.errorCounts)) {
+      throw new Error(`连续帧样例：逐块错误数不符，期望 ${ge.errorCounts}，实得 ${gotCounts}。`);
+    }
+    for (const b of good.blocks) {
+      if (!b.ok || b.result.roots.length !== b.result.locator.degree) {
+        throw new Error(`连续帧样例：第 ${b.ordinal} 块定位证据不闭合。`);
+      }
+    }
+    console.log(
+      `[smoke] /frame-sample.json goodFrame 200 OK -> ${good.blockCount} 块全部可纠正，逐块错误数 [${gotCounts.join(', ')}]`
+    );
+
+    // 场景二：某块超出能力 / 证据不闭合，其余块保留，整帧拒绝
+    const bad = analyzeBchFrame(frameSample.rejectedFrame.input);
+    const be = frameSample.rejectedFrame.expect;
+    if (bad.allCorrectable !== be.allCorrectable || bad.correctedFrame !== undefined) {
+      throw new Error('连续帧样例：含坏块时必须拒绝整帧采用且不给出纠正整帧。');
+    }
+    const failedOrdinals = bad.blocks.filter((x) => !x.ok).map((x) => x.ordinal);
+    if (JSON.stringify(failedOrdinals) !== JSON.stringify(be.failedOrdinals)) {
+      throw new Error(`连续帧样例：失败块不符，期望 ${be.failedOrdinals}，实得 ${failedOrdinals}。`);
+    }
+    if (bad.blocks[0].result.corrected !== be.correctedBlock0) {
+      throw new Error('连续帧样例：坏块之前的其余块结果未保留。');
+    }
+    if (bad.blocks[2].result.corrected !== be.correctedBlock2) {
+      throw new Error('连续帧样例：坏块之后的其余块结果未保留。');
+    }
+    if (!/超过纠错能力|无法闭合/.test(bad.blocks[1].reason)) {
+      throw new Error('连续帧样例：坏块失败原因未指明超出能力或证据不闭合。');
+    }
+    if (bad.frame !== frameSample.rejectedFrame.input.frameStr) {
+      throw new Error('连续帧样例：原始整帧未按输入回显。');
+    }
+    console.log(
+      `[smoke] /frame-sample.json rejectedFrame 200 OK -> 第 ${failedOrdinals.join('、')} 块失败，其余块保留，整帧拒绝采用`
+    );
+    console.log('\n全部复核通过：测试、构建、健康页、单块与连续帧样例冒烟均闭合。');
   } catch (e) {
     failed = e;
   } finally {
