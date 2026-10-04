@@ -1,14 +1,15 @@
 // scripts/verify.mjs — 一次性复核流水线（成功以退出码 0 结束，失败非零）：
-//   1) 针对本题运行有限域与纠错规则测试（node --test）；
+//   1) 针对本题运行有限域与纠错规则测试（node --test，含连续整帧批量场景）；
 //   2) 构建静态页面到 dist/；
-//   3) 启动静态服务器，对健康页 /health 与可纠正样例作 HTTP 冒烟，
-//      并在进程内重新执行纠错规则，确认样例证据闭合。
+//   3) 启动静态服务器，对健康页 /health、页面资源与样例作 HTTP 冒烟：
+//      单码字样例与连续整帧样例都在进程内用同一套纠错规则复核证据闭合，
+//      并确认页面确实提供批量模式入口（模式切换、块数输入、整帧结果区）。
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { analyzeBch } from '../src/bch.js';
+import { analyzeBch, analyzeFrame } from '../src/bch.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -42,13 +43,13 @@ async function waitForHealth(url, deadline) {
 }
 
 async function main() {
-  console.log('=== 步骤 1/3：有限域与 BCH 纠错规则测试 ===');
+  console.log('=== 步骤 1/3：有限域与 BCH 纠错规则测试（含连续整帧批量场景） ===');
   await run(process.execPath, ['--test', 'test/']);
 
   console.log('=== 步骤 2/3：构建静态页面 ===');
   await run(process.execPath, ['scripts/build.mjs']);
 
-  console.log('=== 步骤 3/3：HTTP 冒烟（健康页 + 可纠正样例） ===');
+  console.log('=== 步骤 3/3：HTTP 冒烟（健康页 + 页面批量入口 + 单码字/整帧样例） ===');
   // 若提供 WEB_BASE（如 Compose 中指向 web 服务），直接对该服务冒烟；
   // 否则在进程内自起一台静态服务器完成冒烟。
   const externalBase = process.env.WEB_BASE ? process.env.WEB_BASE.replace(/\/$/, '') : null;
@@ -80,11 +81,30 @@ async function main() {
     console.log('[smoke] /health 200 OK ->', JSON.stringify(health));
 
     // 页面与 Worker 资源
-    for (const path of ['/', '/app.js', '/worker.js', '/lib/gf.js', '/lib/bch.js']) {
+    const resources = ['/', '/app.js', '/worker.js', '/lib/gf.js', '/lib/bch.js'];
+    const bodies = {};
+    for (const path of resources) {
       const r = await fetch(base + path);
       if (r.status !== 200) throw new Error(`资源 ${path} 状态码 ${r.status}`);
-      console.log(`[smoke] GET ${path} 200 (${(await r.arrayBuffer()).byteLength} 字节)`);
+      bodies[path] = await r.text();
+      console.log(`[smoke] GET ${path} 200 (${Buffer.byteLength(bodies[path])} 字节)`);
     }
+
+    // 页面可用性：批量模式入口与整帧结果区必须出现在所服务的页面/脚本中
+    const htmlChecks = ['name="mode"', 'value="frame"', 'id="blk-count"', 'id="frame-bits"',
+      'id="frame-result"', 'id="frame-blocks"', 'id="frame-concat"'];
+    for (const needle of htmlChecks) {
+      if (!bodies['/'].includes(needle)) {
+        throw new Error(`页面缺少批量模式元素：${needle}`);
+      }
+    }
+    if (!bodies['/app.js'].includes('analyzeFrame')) {
+      throw new Error('app.js 未接入 analyzeFrame 批量复核流程。');
+    }
+    if (!bodies['/worker.js'].includes('analyzeFrame')) {
+      throw new Error('worker.js 未导出 analyzeFrame 批量复核入口。');
+    }
+    console.log('[smoke] 页面批量模式入口齐全（模式切换 / 块数 / 连续比特串 / 整帧结果区）');
 
     // 可纠正样例冒烟：经 HTTP 取得样例，再在本地执行同一套纠错规则复核
     const sResp = await fetch(`${base}/sample.json`);
@@ -107,7 +127,41 @@ async function main() {
       `[smoke] /sample.json 200 OK -> 纠正 ${result.errorCount} 位，g=${result.generator.text}`
     );
     console.log(`[smoke] 纠正码字：${result.corrected}`);
-    console.log('\n全部复核通过：测试、构建、健康页与可纠正样例冒烟均闭合。');
+
+    // 连续整帧样例冒烟：经 HTTP 取得样例，逐块复核并确认整帧可采用
+    const fResp = await fetch(`${base}/sample-frame.json`);
+    if (fResp.status !== 200) throw new Error(`/sample-frame.json 状态码 ${fResp.status}`);
+    const frameSample = await fResp.json();
+    const frame = analyzeFrame(frameSample.input);
+    if (!frame.adopted) throw new Error('整帧样例未被采用：存在未闭合的块。');
+    if (frame.blocks.length !== frameSample.input.blockCount) {
+      throw new Error(`整帧块数不符：期望 ${frameSample.input.blockCount}，实得 ${frame.blocks.length}`);
+    }
+    if (frame.totalErrors !== frameSample.expect.totalErrors) {
+      throw new Error(`整帧错误总数不符：期望 ${frameSample.expect.totalErrors}，实得 ${frame.totalErrors}`);
+    }
+    if (frame.frameCorrected !== frameSample.expect.frameCorrected) {
+      throw new Error('整帧纠正结果与构建期记录不一致。');
+    }
+    frame.blocks.forEach((b, i) => {
+      if (!b.ok) throw new Error(`第 ${i + 1} 块未闭合：${b.error}`);
+      if (b.result.roots.length !== b.result.locator.degree) {
+        throw new Error(`第 ${i + 1} 块定位证据不闭合：根数 ≠ deg(Λ)。`);
+      }
+      if (b.result.errorCount !== frameSample.expect.blockErrorCounts[i]) {
+        throw new Error(`第 ${i + 1} 块错误数不符。`);
+      }
+    });
+    const gotFrameIdx = frame.blocks.map((b) => b.result.roots.map((x) => x.frameIndex1));
+    if (JSON.stringify(gotFrameIdx) !== JSON.stringify(frameSample.expect.blockErrorFrameIndexes1)) {
+      throw new Error('整帧错误位置（整帧 1 基）与构建期记录不一致。');
+    }
+    console.log(
+      `[smoke] /sample-frame.json 200 OK -> ${frame.params.blockCount} 块整帧可采用，` +
+      `错误分布 ${frameSample.expect.blockErrorCounts.join('/')}`
+    );
+    console.log(`[smoke] 纠正整帧：${frame.frameCorrected}`);
+    console.log('\n全部复核通过：测试、构建、健康页、批量入口与单码字/整帧样例冒烟均闭合。');
   } catch (e) {
     failed = e;
   } finally {

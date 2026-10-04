@@ -259,22 +259,11 @@ export function chienSearch(field, lambda, L) {
 }
 
 /**
- * 完整复核入口。成功返回结构化证据；任何无法闭合的情况抛出中文 Error。
- *
- * 输入：
- *   m        域阶数（2..20）
- *   polyStr  m 次本原多项式比特串（首位 x^m，末位常数项）
- *   t        纠错能力
- *   rStr     长度恰为 2^m−1 的接收码字（最左为 x^(n−1)）
+ * 单个接收码字的复核流水线（步骤 3–7）。域与生成多项式由调用方构造，
+ * 供 analyzeBch（单码字）与 analyzeFrame（连续整帧逐块）共用同一套规则。
  */
-export function analyzeBch({ m, polyStr, t, rStr }) {
-  // 1) 先验证多项式确为 m 次本原多项式。
-  const f = validatePrimitivePolynomial(m, polyStr);
-  const field = makeField(m, f);
+function analyzeCodeword(field, generator, { m, t, polyStr }, rStr) {
   const n = field.n;
-
-  // 2) 由连续根 α..α^(2t) 的循环陪集构造二进制生成多项式。
-  const generator = buildGenerator(field, m, t);
 
   // 3) 接收串合法性。
   if (typeof rStr !== 'string' || rStr.length !== n || !/^[01]+$/.test(rStr)) {
@@ -363,6 +352,134 @@ export function analyzeBch({ m, polyStr, t, rStr }) {
       L === 0
         ? '综合症全部为零：接收码字本身就是合法码字，无需纠正。'
         : `可纠正：定位到 ${L} 个错误比特，纠正后全部 ${twoT} 个综合症归零。`,
+  };
+}
+
+/**
+ * 完整复核入口（单码字）。成功返回结构化证据；任何无法闭合的情况抛出中文 Error。
+ *
+ * 输入：
+ *   m        域阶数（2..20）
+ *   polyStr  m 次本原多项式比特串（首位 x^m，末位常数项）
+ *   t        纠错能力
+ *   rStr     长度恰为 2^m−1 的接收码字（最左为 x^(n−1)）
+ */
+export function analyzeBch({ m, polyStr, t, rStr }) {
+  // 1) 先验证多项式确为 m 次本原多项式。
+  const f = validatePrimitivePolynomial(m, polyStr);
+  const field = makeField(m, f);
+
+  // 2) 由连续根 α..α^(2t) 的循环陪集构造二进制生成多项式。
+  const generator = buildGenerator(field, m, t);
+
+  // 3–7) 单码字复核流水线。
+  return analyzeCodeword(field, generator, { m, t, polyStr }, rStr);
+}
+
+/** 连续整帧批量复核的块数上限（防止误粘贴超大输入拖垮页面）。 */
+export const MAX_FRAME_BLOCKS = 256;
+
+/**
+ * 连续整帧批量复核入口。地面工程师一次下传 B 个等长码字（同一 BCH 参数），
+ * 按当前 m 推导的码长 n=2^m−1 切分，每个块独立走与单码字完全一致的复核流水线。
+ *
+ * 输入：
+ *   m, polyStr, t  与 analyzeBch 相同（对整帧所有块共用）
+ *   frameStr       连续比特串，长度须恰为 blockCount × n
+ *   blockCount     块数 B（1..MAX_FRAME_BLOCKS）
+ *
+ * 返回：
+ *   blocks[i]      第 i 块结果：{ index, ok:true, result } 或 { index, ok:false, error, received }
+ *                  —— 单块失败不丢弃其余块的证据；
+ *   adopted        仅当全部块闭合才为 true；否则明确拒绝整帧采用；
+ *   frameReceived / frameCorrected  拼接整帧（未采用时 frameCorrected 为 null）。
+ * 块数、总长度、字符集或共享参数非法时抛出中文 Error（此时不产生任何块结论）。
+ */
+export function analyzeFrame({ m, polyStr, t, frameStr, blockCount }) {
+  // 1) 共享参数：与单码字相同，先验证本原多项式，再构造生成多项式。
+  const f = validatePrimitivePolynomial(m, polyStr);
+  const field = makeField(m, f);
+  const n = field.n;
+  const generator = buildGenerator(field, m, t);
+
+  // 2) 块数合法性。
+  if (
+    blockCount === undefined ||
+    blockCount === null ||
+    (typeof blockCount === 'string' && blockCount.trim() === '')
+  ) {
+    throw new Error(`块数非法：请填写块数（1 ≤ B ≤ ${MAX_FRAME_BLOCKS} 的整数）。`);
+  }
+  const B = Number(blockCount);
+  if (!Number.isInteger(B) || B < 1 || B > MAX_FRAME_BLOCKS) {
+    throw new Error(
+      `块数非法：需为 1 ≤ B ≤ ${MAX_FRAME_BLOCKS} 的整数，实际收到「${String(blockCount)}」。`
+    );
+  }
+
+  // 3) 整帧比特串：字符集与总长度（总长度 = 块数 × 当前 m 推导的码长）。
+  if (typeof frameStr !== 'string' || !/^[01]+$/.test(frameStr)) {
+    throw new Error('整帧比特串非法：只能包含字符 0 和 1（连续下传不应含空白或其它符号）。');
+  }
+  const expected = B * n;
+  if (frameStr.length !== expected) {
+    throw new Error(
+      `整帧总长度非法：按当前 m 推导码长 n=2^${m}−1=${n}，${B} 块应为 ${B}×${n}=${expected} 位，实际 ${frameStr.length} 位。`
+    );
+  }
+
+  // 4) 逐块复核：单块失败只标记该块，其余块证据照常保留。
+  const blocks = [];
+  const correctedParts = [];
+  const failedIndexes = [];
+  for (let b = 0; b < B; b++) {
+    const rStr = frameStr.slice(b * n, (b + 1) * n);
+    try {
+      const result = analyzeCodeword(field, generator, { m, t, polyStr }, rStr);
+      for (const root of result.roots) {
+        root.frameIndex0 = b * n + root.stringIndex0; // 整帧 0 基下标（自左向右）
+        root.frameIndex1 = root.frameIndex0 + 1; // 整帧 1 基位置
+      }
+      blocks.push({ index: b, ok: true, result });
+      correctedParts.push(result.corrected);
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      failedIndexes.push(b);
+      blocks.push({ index: b, ok: false, error: message, received: rStr });
+      correctedParts.push(null);
+    }
+  }
+
+  const adopted = failedIndexes.length === 0;
+  const totalErrors = blocks.reduce((acc, b) => acc + (b.ok ? b.result.errorCount : 0), 0);
+  const failedList = failedIndexes.map((i) => `第 ${i + 1} 块`).join('、');
+
+  return {
+    params: {
+      m, n, t,
+      primitiveBits: polyStr,
+      k: generator.k,
+      blockCount: B,
+      totalLength: expected,
+    },
+    generator: {
+      bits: generator.g.toString(2),
+      text: formatBinaryPolynomial(generator.g),
+      degree: generator.degree,
+      k: generator.k,
+      cosets: generator.cosets,
+    },
+    blocks,
+    totalErrors,
+    adopted,
+    frameReceived: frameStr,
+    frameCorrected: adopted ? correctedParts.join('') : null,
+    conclusion: adopted
+      ? totalErrors === 0
+        ? `整帧可采用：${B} 个块综合症全部为零，均为合法码字，无需纠正。`
+        : `整帧可采用：${B} 个块全部通过闭合校验，共纠正 ${totalErrors} 个错误比特。`
+      : `拒绝整帧采用：${failedList} 未通过复核（超纠错能力或定位证据不闭合），` +
+        '其余块结果保留如下，但整帧不得作为正常数据采用。',
   };
 }
 

@@ -1,7 +1,8 @@
 // scripts/build.mjs — 构建静态页面到 dist/：
 //   1) 复制 web/ 全部资源；
 //   2) 复制共享核心 src/*.js 到 dist/lib/（Worker 以 ./lib/bch.js 引入）；
-//   3) 用核心库生成一个“可纠正样例” sample.json，供 verify HTTP 冒烟使用。
+//   3) 用核心库生成一个“可纠正样例” sample.json 与一个“连续整帧样例”
+//      sample-frame.json，供 verify HTTP 冒烟使用。
 import { rm, mkdir, cp, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,7 +20,7 @@ async function main() {
   await cp(resolve(ROOT, 'src', 'bch.js'), resolve(DIST, 'lib', 'bch.js'));
 
   // 生成可纠正样例：(15,7) BCH，t=2，对随机选定信息做系统编码后注入两个硬错误。
-  const { analyzeBch, buildGenerator } = await import('../src/bch.js');
+  const { analyzeBch, analyzeFrame, buildGenerator } = await import('../src/bch.js');
   const { makeField, validatePrimitivePolynomial } = await import('../src/gf.js');
 
   function bMul(a, b) {
@@ -34,20 +35,26 @@ async function main() {
     while (dr >= dm) { r ^= m << BigInt(dr - dm); dr = r === 0n ? -1 : r.toString(2).length - 1; }
     return r;
   }
+  // 系统编码 c = u·x^(n−k) + (u·x^(n−k) mod g)
+  function systematicEncode(gen, message) {
+    const shifted = BigInt(message) << BigInt(gen.n - gen.k);
+    return (shifted ^ bMod(shifted, gen.g)).toString(2).padStart(gen.n, '0');
+  }
+  function flipAt(str, positions) {
+    const a = str.split('');
+    for (const p of positions) a[p] = a[p] === '0' ? '1' : '0';
+    return a.join('');
+  }
 
   const m = 4;
   const polyStr = '10011';
   const t = 2;
   const field = makeField(m, validatePrimitivePolynomial(m, polyStr));
   const gen = buildGenerator(field, m, t);
-  // 系统编码 c = u·x^(n−k) + (u·x^(n−k) mod g)
   const message = 0b1101001;
-  const shifted = BigInt(message) << BigInt(gen.n - gen.k);
-  const codeword = (shifted ^ bMod(shifted, gen.g)).toString(2).padStart(gen.n, '0');
+  const codeword = systematicEncode(gen, message);
   // 翻转串内 0 基位置 2、9（对应 x^12、x^5）
-  const cwArr = codeword.split('');
-  for (const p of [2, 9]) cwArr[p] = cwArr[p] === '0' ? '1' : '0';
-  const sampleInput = { m, polyStr, t, rStr: cwArr.join('') };
+  const sampleInput = { m, polyStr, t, rStr: flipAt(codeword, [2, 9]) };
   const result = analyzeBch(sampleInput);
   if (result.errorCount !== 2 || !result.roots || result.roots.length !== result.locator.degree) {
     throw new Error('构建失败：内置可纠正样例未按预期闭合。');
@@ -71,7 +78,51 @@ async function main() {
     'utf-8'
   );
 
-  console.log('[build] dist/ 就绪：页面 + Worker + 共享核心库 + sample.json');
+  // 连续整帧样例：同参数 3 块拼接 —— 第 1 块注入 2 个错误，第 2 块干净，第 3 块注入 1 个错误。
+  const blockCount = 3;
+  const cleanBlocks = [
+    systematicEncode(gen, 0b1011001),
+    systematicEncode(gen, 0b0110110),
+    systematicEncode(gen, 0b1111111),
+  ];
+  const receivedBlocks = [
+    flipAt(cleanBlocks[0], [1, 12]),
+    cleanBlocks[1],
+    flipAt(cleanBlocks[2], [7]),
+  ];
+  const frameInput = { m, polyStr, t, blockCount, frameStr: receivedBlocks.join('') };
+  const frameResult = analyzeFrame(frameInput);
+  if (
+    !frameResult.adopted ||
+    frameResult.totalErrors !== 3 ||
+    frameResult.frameCorrected !== cleanBlocks.join('')
+  ) {
+    throw new Error('构建失败：内置连续整帧样例未按预期闭合。');
+  }
+  await writeFile(
+    resolve(DIST, 'sample-frame.json'),
+    JSON.stringify(
+      {
+        description: 'verify 冒烟样例：(15,7,2) 连续整帧 3 块，错误分布 2/0/1，整帧可采用',
+        input: frameInput,
+        expect: {
+          adopted: true,
+          totalErrors: 3,
+          blockErrorCounts: frameResult.blocks.map((b) => b.result.errorCount),
+          frameCorrected: frameResult.frameCorrected,
+          // 每块错误的整帧 1 基位置（块序展开）
+          blockErrorFrameIndexes1: frameResult.blocks.map((b) =>
+            b.result.roots.map((x) => x.frameIndex1)
+          ),
+        },
+      },
+      null,
+      2
+    ),
+    'utf-8'
+  );
+
+  console.log('[build] dist/ 就绪：页面 + Worker + 共享核心库 + sample.json + sample-frame.json');
 }
 
 main().catch((e) => {
