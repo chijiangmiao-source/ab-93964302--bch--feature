@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>窄义二进制 BCH 离线复核</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #171d24; --line: #2a3440;
+    --fg: #d7e0e8; --dim: #8b9aa8; --accent: #4da3ff;
+    --ok: #3fb950; --err: #f85149; --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header { padding: 20px 28px 12px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0 0 4px; font-size: 18px; }
+  header p { margin: 0; color: var(--dim); font-size: 13px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 20px 28px 60px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 16px 20px; margin-bottom: 18px;
+  }
+  .grid { display: grid; grid-template-columns: 120px 1fr; gap: 12px 16px; align-items: start; }
+  label { color: var(--dim); padding-top: 7px; }
+  input[type="number"], input[type="text"] {
+    width: 100%; background: #0c1116; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px;
+    font: 13px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 4px; }
+  .buttons { display: flex; gap: 10px; margin-top: 14px; }
+  button {
+    background: var(--accent); color: #08111c; border: 0; border-radius: 6px;
+    padding: 8px 22px; font-weight: 600; cursor: pointer;
+  }
+  button.secondary { background: #2b3540; color: var(--fg); }
+  button:disabled { opacity: .55; cursor: default; }
+  #status { margin-top: 12px; font-size: 13px; min-height: 20px; }
+  #status.busy { color: var(--warn); }
+  #status.ok { color: var(--ok); }
+  #status.err { color: var(--err); }
+  .result { display: none; }
+  .result.show { display: block; }
+  h2 { font-size: 14px; margin: 0 0 10px; color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { border: 1px solid var(--line); padding: 5px 9px; text-align: left; vertical-align: top; }
+  th { color: var(--dim); font-weight: 600; background: #12181f; }
+  td.mono, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; word-break: break-all; }
+  .codeword { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
+  .codeword mark { background: transparent; color: var(--err); font-weight: 700; }
+  .badge { display: inline-block; border-radius: 4px; padding: 1px 8px; font-size: 12px; font-weight: 600; }
+  .badge.ok { background: rgba(63,185,80,.15); color: var(--ok); }
+  .badge.err { background: rgba(248,81,73,.15); color: var(--err); }
+  .fail {
+    display: none; border-color: rgba(248,81,73,.5);
+  }
+  .fail.show { display: block; }
+  .fail h2 { color: var(--err); }
+  .scroll-x { overflow-x: auto; }
+  footer { color: var(--dim); font-size: 12px; text-align: center; padding: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>窄义二进制 BCH 码字离线复核</h1>
+  <p>硬判决链路 · 码长 n = 2<sup>m</sup>−1 · 连续根 α, α², …, α<sup>2t</sup> · 所有运算在本地浏览器 Worker 内完成，不发起任何网络请求</p>
+</header>
+<main>
+  <section class="panel">
+    <div class="grid">
+      <label for="m">域阶数 m</label>
+      <div>
+        <input id="m" type="number" min="2" max="20" step="1" value="4">
+        <div class="hint">2 ≤ m ≤ 20，码长 n = 2<sup>m</sup>−1</div>
+      </div>
+
+      <label for="poly">本原多项式</label>
+      <div>
+        <input id="poly" type="text" spellcheck="false" autocomplete="off" value="10011">
+        <div class="hint">m 次本原多项式比特串，长度 m+1；首位为 x<sup>m</sup> 系数，末位为常数项。如 m=4：10011 表示 x⁴+x+1</div>
+      </div>
+
+      <label for="t">纠错能力 t</label>
+      <div>
+        <input id="t" type="number" min="1" step="1" value="1">
+        <div class="hint">需 1 ≤ t 且 2t+1 ≤ n</div>
+      </div>
+
+      <label for="r">接收码字</label>
+      <div>
+        <input id="r" type="text" spellcheck="false" autocomplete="off"
+          value="000000000000010">
+        <div class="hint">仅含 0/1，长度须恰为 2<sup>m</sup>−1；最左位对应 x<sup>n−1</sup>，综合症 / BM / Chien 共用同一位序</div>
+      </div>
+    </div>
+    <div class="buttons">
+      <button id="btn-run">复核</button>
+      <button id="btn-clear" class="secondary">清空草稿和结论</button>
+    </div>
+    <div id="status" role="status" aria-live="polite"></div>
+  </section>
+
+  <section id="fail" class="panel fail">
+    <h2>复核失败</h2>
+    <div id="fail-reason"></div>
+  </section>
+
+  <section id="result" class="panel result">
+    <h2>① 参数与生成多项式</h2>
+    <div class="scroll-x"><table>
+      <tbody id="t-meta"></tbody>
+    </table></div>
+    <p class="hint" id="p-cosets"></p>
+    <div class="scroll-x" style="margin-top:8px"><table>
+      <thead><tr><th>陪集代表 s</th><th>成员 {j : α^j 同陪集}</th><th>最小多项式</th></tr></thead>
+      <tbody id="t-cosets"></tbody>
+    </table></div>
+  </section>
+
+  <section id="result2" class="panel result">
+    <h2>② 综合症 S_j = r(α^j)，j = 1…2t</h2>
+    <div class="scroll-x"><table>
+      <thead><tr id="th-syn"></tr></thead>
+      <tbody><tr id="td-syn"></tr></tbody>
+    </table></div>
+  </section>
+
+  <section id="result3" class="panel result">
+    <h2>③ Berlekamp–Massey 错误定位多项式</h2>
+    <div class="mono" id="locator-text"></div>
+    <div class="scroll-x" style="margin-top:8px"><table>
+      <thead><tr><th>i</th><th>Λ_i（GF(2^m) 元素）</th></tr></thead>
+      <tbody id="t-loc"></tbody>
+    </table></div>
+  </section>
+
+  <section id="result4" class="panel result">
+    <h2>④ Chien 搜索：Λ(α<sup>−i</sup>) = 0 对应的比特位置</h2>
+    <div class="scroll-x"><table>
+      <thead><tr><th>错误位 x^i（幂次）</th><th>定位根</th><th>串内位置（自左数，1 基）</th></tr></thead>
+      <tbody id="t-roots"></tbody>
+    </table></div>
+  </section>
+
+  <section id="result5" class="panel result">
+    <h2>⑤ 纠正结果 <span id="conclusion-badge" class="badge ok"></span></h2>
+    <table>
+      <tbody>
+        <tr><th>接收码字</th><td id="cw-in" class="mono codeword"></td></tr>
+        <tr><th>纠正码字</th><td id="cw-out" class="mono codeword"></td></tr>
+        <tr id="row-recheck"><th>纠正后综合症</th><td id="cw-recheck" class="mono"></td></tr>
+      </tbody>
+    </table>
+    <p class="hint" id="conclusion-text"></p>
+  </section>
+</main>
+<footer>本地静态页面 · Worker 先验证本原性再构造生成多项式 · 仅当根数 = deg(Λ) 且纠正后综合症全零才给出可纠正结论</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

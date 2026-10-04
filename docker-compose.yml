@@ -1,0 +1,43 @@
+# Docker Compose：静态页面 web（长驻，可配置宿主机端口 + 健康检查）
+# 与 verify（针对本题的单次复核：测试 → 构建 → HTTP 冒烟 → 退出码结束）。
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: narrow-sense-bch-review:latest
+    container_name: bch-review-web
+    ports:
+      # 宿主机端口可通过环境变量 HOST_PORT 配置，默认 8080；容器内固定 8080
+      - "${HOST_PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/health').then(r=>{if(r.status!==200)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  verify:
+    image: narrow-sense-bch-review:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bch-review-verify
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      # 对已启动的 web 服务做健康页与可纠正样例冒烟；
+      # 测试与页面构建仍在 verify 容器内完整执行。
+      WEB_BASE: "http://web:8080"
+    # 单次服务：运行有限域与纠错规则测试、构建页面、HTTP 冒烟，随后以退出码结束
+    command: ["node", "scripts/verify.mjs"]
+    restart: "no"

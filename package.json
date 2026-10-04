@@ -1,0 +1,16 @@
+{
+  "name": "narrow-sense-bch-review",
+  "version": "1.0.0",
+  "description": "窄义二进制本原 BCH 码字离线复核（硬判决链路，浏览器 Worker + 零依赖 Node 核心）",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/",
+    "build": "node scripts/build.mjs",
+    "start": "node scripts/server.js",
+    "verify": "node scripts/verify.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
